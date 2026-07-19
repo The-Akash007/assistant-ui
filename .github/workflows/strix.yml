@@ -1,10 +1,13 @@
 name: Strix Security Scan
+permissions:
+  contents: read
+  security-events: write
 
 on:
-  push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
+  push:        # runs on all branches
+  pull_request: # runs on all PRs to any branch
+  workflow_dispatch: # manual run
+  workflow_call: # reusable from other workflows
 
 jobs:
   strix-scan:
@@ -19,33 +22,49 @@ jobs:
         with:
           node-version: '18'
 
-      - name: Install Strix CLI
+      - name: Install Strix CLI (from GitHub)
         run: |
-          # pin a version if available: npm install -g strix-cli@<version>
-          npm install -g strix-cli
-
+          echo "Installing Strix CLI from GitHub repository usestrix/strix..."
+          # install directly from the GitHub repository; fail the job if install fails
+          npm install -g git+https://github.com/usestrix/strix.git
+          echo "Installed: $(command -v strix || echo 'not found')"
+      
       - name: Run Strix security scan
         id: strix_scan
         env:
           STRIX_LLM_API_KEY: ${{ secrets.STRIX_LLM_API_KEY }}
         run: |
           set -o pipefail
-          # Run the scan and produce SARIF output (adjust flags to the CLI's actual flags)
-          # Allow non-zero exit so we can capture the exit code and still upload artifacts.
+          # Ensure the CLI is available
+          if ! command -v strix >/dev/null 2>&1; then
+            echo "strix: command not found after install. Aborting scan."
+            echo "scan_exit_code=127" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+          # Run the scan and produce SARIF. Allow the scan command to return non-zero so we capture the exit code.
           strix scan --format sarif --output strix-report.sarif || true
           echo "scan_exit_code=$?" >> $GITHUB_OUTPUT
 
+      - name: Check SARIF and set output
+        id: check_sarif
+        run: |
+          if [ -f strix-report.sarif ]; then
+            echo "file_exists=true" >> $GITHUB_OUTPUT
+            ls -l strix-report.sarif
+          else
+            echo "file_exists=false" >> $GITHUB_OUTPUT
+          fi
+
       - name: Upload Strix SARIF report (artifact)
-        if: always()
+        if: steps.check_sarif.outputs.file_exists == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: strix-report
           path: strix-report.sarif
 
-      # Optional: upload SARIF to GitHub Code Scanning (so results appear in Security tab)
       - name: Upload SARIF to GitHub Code Scanning
-        if: always()
-        uses: github/codeql-action/upload-sarif@v2
+        if: steps.check_sarif.outputs.file_exists == 'true'
+        uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: strix-report.sarif
 
