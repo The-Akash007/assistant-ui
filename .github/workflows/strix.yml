@@ -1,0 +1,56 @@
+name: Strix Security Scan
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  strix-scan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install Strix CLI
+        run: |
+          # pin a version if available: npm install -g strix-cli@<version>
+          npm install -g strix-cli
+
+      - name: Run Strix security scan
+        id: strix_scan
+        env:
+          STRIX_LLM_API_KEY: ${{ secrets.STRIX_LLM_API_KEY }}
+        run: |
+          set -o pipefail
+          # Run the scan and produce SARIF output (adjust flags to the CLI's actual flags)
+          # Allow non-zero exit so we can capture the exit code and still upload artifacts.
+          strix scan --format sarif --output strix-report.sarif || true
+          echo "scan_exit_code=$?" >> $GITHUB_OUTPUT
+
+      - name: Upload Strix SARIF report (artifact)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: strix-report
+          path: strix-report.sarif
+
+      # Optional: upload SARIF to GitHub Code Scanning (so results appear in Security tab)
+      - name: Upload SARIF to GitHub Code Scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: strix-report.sarif
+
+      - name: Fail workflow on non-zero scan exit
+        if: steps.strix_scan.outputs.scan_exit_code != '0'
+        run: |
+          echo "Strix scan exited with code ${{ steps.strix_scan.outputs.scan_exit_code }} — failing job"
+          exit ${{ steps.strix_scan.outputs.scan_exit_code }}
