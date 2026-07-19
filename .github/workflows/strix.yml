@@ -17,6 +17,11 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
@@ -25,8 +30,12 @@ jobs:
       - name: Install Strix CLI (from GitHub)
         run: |
           echo "Installing Strix CLI from GitHub repository usestrix/strix..."
-          # install directly from the GitHub repository; fail the job if install fails
-          npm install -g git+https://github.com/usestrix/strix.git
+          if ! pip install git+https://github.com/usestrix/strix.git 2>/dev/null; then
+            echo "Direct pip install failed, trying alternative method..."
+            git clone https://github.com/usestrix/strix.git /tmp/strix
+            cd /tmp/strix
+            pip install -e .
+          fi
           echo "Installed: $(command -v strix || echo 'not found')"
       
       - name: Run Strix security scan
