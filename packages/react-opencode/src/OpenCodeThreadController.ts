@@ -115,7 +115,7 @@ const toPermissionRequest = (
     permission: request.permission,
     patterns: request.patterns,
     metadata,
-    always: request.always,
+    always: Array.isArray(request.always) ? request.always : [],
     tool: request.tool,
     toolName:
       typeof toolNameValue === "string" ? toolNameValue : request.permission,
@@ -189,11 +189,16 @@ export class OpenCodeThreadController implements OpenCodeThreadControllerLike {
     }
   >();
 
+  private readonly client: OpencodeClient;
+  private readonly sessionId: string;
+
   constructor(
-    private readonly client: OpencodeClient,
+    client: OpencodeClient,
     getEventSource: OpenCodeEventSourceProvider,
-    private readonly sessionId: string,
+    sessionId: string,
   ) {
+    this.client = client;
+    this.sessionId = sessionId;
     this.state = createOpenCodeThreadState(sessionId);
     this.getEventSource = getEventSource;
   }

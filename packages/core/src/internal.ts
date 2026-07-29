@@ -40,7 +40,8 @@ export { CompositeContextProvider } from "./utils/composite-context-provider";
 
 // Shared attachment data-URL encoder, reused by framework adapters so the
 // FileReader fallback lives in one place.
-export { getFileDataURL } from "./adapters/attachment";
+export { getFileDataURL, fileMatchesAccept } from "./adapters/attachment";
+export { isCreateAttachment } from "./types/attachment";
 
 // Streaming-stable tool-args stringifier, reused by framework adapters so the
 // key-order stabilization lives in one place.
@@ -53,12 +54,9 @@ export {
 // validation lives in one place.
 export { isJSONValue, isRecord } from "./utils/json/is-json";
 
-// Runtime extras helper for external-store adapters. Internal because the
-// tap-native runtime path replaces the `thread.extras` side-channel it wraps.
-export {
-  createRuntimeExtras,
-  type RuntimeExtras,
-} from "./react/runtimes/createRuntimeExtras";
+// Data-URL decoder and http(s) matcher, reused by framework adapters so the
+// outbound part conversion lives in one place.
+export { httpUrlPattern, parseDataUrl } from "./utils/data-url";
 
 export * from "./runtime/internal";
 export * from "./runtimes/internal";

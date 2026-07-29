@@ -8,6 +8,7 @@ import {
   type ToolCallMessagePart,
   type ToolModelContentPart,
 } from "@assistant-ui/core";
+import { readMcpAppResourceUri } from "../mcp-tool-result";
 import type { AgUiEvent, AgUiInterrupt } from "../types";
 import type { Logger } from "../logger";
 
@@ -34,9 +35,11 @@ type ToolCallState = {
   snapshotResultApplied: boolean;
 };
 
-const MCP_APPS_ACTIVITY_TYPE = "mcp-apps";
+export const MCP_APPS_ACTIVITY_TYPE = "mcp-apps";
 
-const isPlainObject = (value: unknown): value is Record<string, unknown> =>
+export const isPlainObject = (
+  value: unknown,
+): value is Record<string, unknown> =>
   !!value && typeof value === "object" && !Array.isArray(value);
 
 export type RunAggregatorOptions = {
@@ -235,8 +238,13 @@ export class RunAggregator {
         this.finishToolCall(
           event.toolCallId,
           event.content ?? "",
-          event.role === "tool" ? false : undefined,
+          typeof event.mcpResult?.isError === "boolean"
+            ? event.mcpResult.isError
+            : event.role === "tool"
+              ? false
+              : undefined,
           event.messageId,
+          event.mcpResult,
         );
         this.emit();
         break;
@@ -442,6 +450,7 @@ export class RunAggregator {
     content: string,
     isError?: boolean,
     toolMessageId?: string,
+    mcpResult?: Record<string, unknown>,
   ) {
     if (!id) return;
     let entry = this.toolCalls.get(id);
@@ -464,7 +473,16 @@ export class RunAggregator {
     ) {
       this.partOrder.push({ kind: "tool-call", toolCallId: id });
     }
-    if (entry.snapshotResultApplied) {
+    if (mcpResult !== undefined && !entry.snapshotResultApplied) {
+      entry.result = mcpResult;
+      entry.modelContent = [{ type: "text", text: content }];
+      entry.snapshotResultApplied = true;
+      entry.isError = isError;
+      if (entry.mcpAppResourceUri === undefined) {
+        const uri = readMcpAppResourceUri(mcpResult._meta);
+        if (uri !== undefined) entry.mcpAppResourceUri = uri;
+      }
+    } else if (entry.snapshotResultApplied) {
       if (entry.modelContent === undefined) {
         entry.modelContent = [{ type: "text", text: content }];
       }

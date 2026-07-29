@@ -11,6 +11,8 @@ import type {
 } from "@assistant-ui/core";
 import type { useExternalMessageConverter } from "@assistant-ui/core/react";
 import {
+  httpUrlPattern,
+  parseDataUrl,
   stableStringifyToolArgs,
   trackToolArgsKeyOrder,
 } from "@assistant-ui/core/internal";
@@ -59,10 +61,16 @@ const resolveToolCallArgs = ({
   toolCallId: string;
 }): Pick<ToolCallMessagePart, "args" | "argsText"> => {
   const cacheKey = getToolArgsCacheKey(messageId, "tool", toolCallId);
+  const streamedArgsText =
+    matchingToolCallChunk?.args ?? matchingToolCallChunk?.args_json;
+  const isStreamingArglessChunk =
+    matchingToolCallChunk !== undefined &&
+    streamedArgsText === undefined &&
+    Object.keys(chunk.args).length === 0;
   const providedArgsText =
     chunk.partial_json ??
-    matchingToolCallChunk?.args ??
-    matchingToolCallChunk?.args_json;
+    streamedArgsText ??
+    (isStreamingArglessChunk ? "" : undefined);
   const argsText =
     providedArgsText ??
     stableStringifyToolArgs(toolArgsKeyOrderCache, cacheKey, chunk.args);
@@ -101,10 +109,23 @@ const warnForUnknownMessagePartType = (type: string) => {
   console.warn(`Unknown message part type: ${type}`);
 };
 
+const warnedMessageTypes = new Set<string>();
+const warnForUnknownMessageType = (type: string) => {
+  if (
+    typeof process === "undefined" ||
+    process?.env?.NODE_ENV !== "development"
+  )
+    return;
+  if (warnedMessageTypes.has(type)) return;
+  warnedMessageTypes.add(type);
+  console.warn(`Unknown message type: ${type}`);
+};
+
 const contentToParts = (
   content: LangChainMessage["content"],
   metadata: LangGraphMessageConverterMetadata,
   messageId: string | undefined,
+  role: "user" | "assistant",
 ) => {
   if (typeof content === "string")
     return [{ type: "text" as const, text: content }];
@@ -141,6 +162,21 @@ const contentToParts = (
                     : part.data,
               mimeType: part.mime_type ?? "application/octet-stream",
             };
+
+          case "audio": {
+            if (role !== "user") return null;
+            const format =
+              part.mime_type === "audio/wav"
+                ? ("wav" as const)
+                : part.mime_type === "audio/mp3"
+                  ? ("mp3" as const)
+                  : null;
+            if (!format) return null;
+            return {
+              type: "audio" as const,
+              audio: { data: part.data, format },
+            };
+          }
 
           case "thinking":
             return { type: "reasoning", text: part.thinking };
@@ -191,7 +227,8 @@ const contentToParts = (
 export const convertLangChainMessages: useExternalMessageConverter.Callback<
   LangChainMessage
 > = (message, metadata: LangGraphMessageConverterMetadata = {}) => {
-  switch (message.type) {
+  const type = message.type;
+  switch (type) {
     case "system":
       return {
         role: "system",
@@ -206,7 +243,7 @@ export const convertLangChainMessages: useExternalMessageConverter.Callback<
       return {
         role: "user",
         id: message.id,
-        content: contentToParts(message.content, metadata, message.id),
+        content: contentToParts(message.content, metadata, message.id, "user"),
         metadata: { custom: getCustomMetadata(message.additional_kwargs) },
         ...(attachments?.length ? { attachments } : {}),
       };
@@ -264,7 +301,7 @@ export const convertLangChainMessages: useExternalMessageConverter.Callback<
         role: "assistant",
         id: message.id,
         content: [
-          ...contentToParts(allContent, metadata, message.id),
+          ...contentToParts(allContent, metadata, message.id, "assistant"),
           ...toolCallParts,
           ...uiDataParts,
         ],
@@ -284,18 +321,13 @@ export const convertLangChainMessages: useExternalMessageConverter.Callback<
         artifact: message.artifact,
         isError: message.status === "error",
       };
+    default: {
+      const _exhaustiveCheck: never = type;
+      warnForUnknownMessageType(_exhaustiveCheck);
+      return [];
+    }
   }
 };
-
-const parseDataUrl = (
-  value: string,
-): { mimeType: string; data: string } | null => {
-  const match = value.match(/^data:([^;,]+)(?:;[^;,]+)*;base64,(.+)$/);
-  if (!match) return null;
-  return { mimeType: match[1]!, data: match[2]! };
-};
-
-const httpUrlPattern = /^https?:\/\//i;
 
 export const getMessageContent = (msg: AppendMessage) => {
   const allContent = [
@@ -304,14 +336,15 @@ export const getMessageContent = (msg: AppendMessage) => {
   ];
 
   const hasNonText = allContent.some(
-    (part) => part.type === "file" || part.type === "image",
+    (part) =>
+      part.type === "file" || part.type === "image" || part.type === "audio",
   );
   const hasText = allContent.some((part) => part.type === "text");
   if (hasNonText && !hasText) {
     allContent.unshift({ type: "text", text: " " });
   }
 
-  const content = allContent.map((part) => {
+  const content = allContent.flatMap((part) => {
     const type = part.type;
     switch (type) {
       case "text":
@@ -339,16 +372,24 @@ export const getMessageContent = (msg: AppendMessage) => {
         };
       }
 
+      case "audio": {
+        const parsed = parseDataUrl(part.audio.data);
+        return {
+          type: "audio" as const,
+          data: parsed?.data ?? part.audio.data,
+          mime_type: `audio/${part.audio.format}`,
+          source_type: "base64" as const,
+        };
+      }
+
+      case "data":
+        return [];
+
       case "tool-call":
         throw new Error("Tool call appends are not supported.");
 
       default: {
-        const _exhaustiveCheck:
-          | "reasoning"
-          | "source"
-          | "audio"
-          | "data"
-          | "generative-ui" = type;
+        const _exhaustiveCheck: "reasoning" | "source" | "generative-ui" = type;
         throw new Error(
           `Unsupported append message part type: ${_exhaustiveCheck}`,
         );

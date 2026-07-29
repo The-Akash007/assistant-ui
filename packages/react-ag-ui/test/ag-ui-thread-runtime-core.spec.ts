@@ -52,6 +52,14 @@ const createCore = (
 
 type TestRunConfig = { custom?: Record<string, unknown> };
 
+const assistantText = (message: ThreadMessage | undefined): string => {
+  if (!message) return "";
+  for (const part of message.content) {
+    if (part.type === "text" && typeof part.text === "string") return part.text;
+  }
+  return "";
+};
+
 describe("AGUIThreadRuntimeCore", () => {
   it("streams assistant output into thread messages", async () => {
     const agent = {
@@ -76,6 +84,128 @@ describe("AGUIThreadRuntimeCore", () => {
       reason: "unknown",
     });
     expect(core.isRunning()).toBe(false);
+  });
+
+  it("keeps streaming after a messages snapshot replaces run history", async () => {
+    const streamedText: Array<string | undefined> = [];
+    let core: AgUiThreadRuntimeCore;
+    const readAssistantText = () => {
+      const assistant = core
+        .getMessages()
+        .find((message) => message.id === "assistant-2") as
+        | ThreadAssistantMessage
+        | undefined;
+      const text = assistant?.content.find((part) => part.type === "text");
+      return text?.type === "text" ? text.text : undefined;
+    };
+    const agent = {
+      runAgent: vi.fn(async (_input, subscriber) => {
+        subscriber.onMessagesSnapshotEvent?.({
+          event: {
+            type: "MESSAGES_SNAPSHOT",
+            messages: [{ id: "user-1", role: "user", content: "hi" }],
+          },
+        });
+        subscriber.onTextMessageStartEvent?.({
+          event: {
+            type: "TEXT_MESSAGE_START",
+            messageId: "assistant-2",
+          },
+        });
+        subscriber.onTextMessageContentEvent?.({
+          event: {
+            type: "TEXT_MESSAGE_CONTENT",
+            messageId: "assistant-2",
+            delta: "Hello",
+          },
+        });
+        streamedText.push(readAssistantText());
+        subscriber.onMessagesSnapshotEvent?.({
+          event: {
+            type: "MESSAGES_SNAPSHOT",
+            messages: [
+              { id: "user-1", role: "user", content: "hi" },
+              {
+                id: "assistant-1",
+                role: "assistant",
+                content: "",
+                toolCalls: [
+                  {
+                    id: "call-1",
+                    type: "function",
+                    function: { name: "lookup", arguments: "{}" },
+                  },
+                ],
+              },
+              {
+                id: "tool-1",
+                role: "tool",
+                toolCallId: "call-1",
+                content: "42",
+              },
+            ],
+          },
+        });
+        subscriber.onTextMessageContentEvent?.({
+          event: {
+            type: "TEXT_MESSAGE_CONTENT",
+            messageId: "assistant-2",
+            delta: " world",
+          },
+        });
+        streamedText.push(readAssistantText());
+        subscriber.onTextMessageEndEvent?.({
+          event: {
+            type: "TEXT_MESSAGE_END",
+            messageId: "assistant-2",
+          },
+        });
+        subscriber.onMessagesSnapshotEvent?.({
+          event: {
+            type: "MESSAGES_SNAPSHOT",
+            messages: [
+              { id: "user-1", role: "user", content: "hi" },
+              {
+                id: "assistant-1",
+                role: "assistant",
+                content: "",
+                toolCalls: [
+                  {
+                    id: "call-1",
+                    type: "function",
+                    function: { name: "lookup", arguments: "{}" },
+                  },
+                ],
+              },
+              {
+                id: "tool-1",
+                role: "tool",
+                toolCallId: "call-1",
+                content: "42",
+              },
+              {
+                id: "assistant-2",
+                role: "assistant",
+                content: "Hello world",
+              },
+            ],
+          },
+        });
+        subscriber.onRunFinalized?.();
+      }),
+    } as unknown as HttpAgent;
+
+    core = createCore(agent);
+    await core.append(createAppendMessage());
+
+    expect(streamedText).toEqual(["Hello", "Hello world"]);
+    expect(core.getMessages()).toHaveLength(3);
+    expect(core.getMessages().at(-1)).toMatchObject({
+      id: "assistant-2",
+      role: "assistant",
+      content: [{ type: "text", text: "Hello world" }],
+      status: { type: "complete" },
+    });
   });
 
   it("imports tool role messages from snapshots as assistant tool-call results", async () => {
@@ -2224,6 +2354,35 @@ describe("AGUIThreadRuntimeCore", () => {
     expect(runCount).toBe(1);
   });
 
+  it("steerAway rejects entries without an interruptId or with an invalid status", async () => {
+    let runCount = 0;
+    const runAgent = vi.fn(async (input: any, subscriber: any) => {
+      runCount++;
+      subscriber.onRunFinishedEvent?.({
+        event: {
+          type: "RUN_FINISHED",
+          runId: input.runId,
+          outcome: {
+            type: "interrupt",
+            interrupts: [{ id: "int-1", reason: "tool_call" }],
+          },
+        },
+      });
+      subscriber.onRunFinalized?.();
+    });
+
+    const core = createCore({ runAgent } as unknown as HttpAgent);
+    await core.append(createAppendMessage());
+
+    await expect(
+      core.steerAway("x", [{ status: "cancelled" } as any]),
+    ).rejects.toThrow("every entry must have an interruptId");
+    await expect(
+      core.steerAway("x", [{ interruptId: "int-1", status: "nope" } as any]),
+    ).rejects.toThrow(/invalid status "nope" for interrupt int-1/);
+    expect(runCount).toBe(1);
+  });
+
   it("steerAway cancels a pending client-side tool call and starts one fresh run", async () => {
     const runInputs: any[] = [];
     let runCount = 0;
@@ -2744,8 +2903,11 @@ describe("AGUIThreadRuntimeCore", () => {
           type: "TOOL_CALL_RESULT",
           messageId: "tool-msg-1",
           toolCallId: "call-1",
-          content: '{"answer":"yes"}',
+          content: "yes",
           role: "tool",
+          structuredContent: { answer: "yes" },
+          _meta: { auditId: "audit-1" },
+          isError: true,
         },
       });
       subscriber.onTextMessageContentEvent?.({
@@ -2779,7 +2941,14 @@ describe("AGUIThreadRuntimeCore", () => {
     expect(toolPart).toMatchObject({
       toolCallId: "call-1",
       toolName: "ask_question",
-      result: { answer: "yes" },
+      result: {
+        content: [{ type: "text", text: "yes" }],
+        structuredContent: { answer: "yes" },
+        _meta: { auditId: "audit-1" },
+        isError: true,
+      },
+      modelContent: [{ type: "text", text: "yes" }],
+      isError: true,
       unstable_toolMessageId: "tool-msg-1",
     });
     expect(second!.content.filter((p) => p.type === "tool-call")).toHaveLength(
@@ -2914,6 +3083,373 @@ describe("AGUIThreadRuntimeCore", () => {
     );
   });
 
+  it("attaches an mcp-apps ACTIVITY_SNAPSHOT for a restored tool call to its owning message", async () => {
+    const callToolResult = {
+      content: [{ type: "text", text: "22C" }],
+      structuredContent: { temperature: "22C" },
+      isError: false,
+    };
+    const runAgent = vi.fn(async (_input: any, subscriber: any) => {
+      subscriber.onMessagesSnapshotEvent?.({
+        event: {
+          type: "MESSAGES_SNAPSHOT",
+          messages: [
+            {
+              id: "msg-1",
+              role: "user",
+              content: "What's the weather?",
+            },
+            {
+              id: "msg-2",
+              role: "assistant",
+              content: "",
+              toolCalls: [
+                {
+                  id: "call-1",
+                  type: "function",
+                  function: {
+                    name: "get_weather",
+                    arguments: '{"city":"Paris"}',
+                  },
+                },
+              ],
+            },
+            {
+              id: "msg-3",
+              role: "tool",
+              toolCallId: "call-1",
+              content: '{"temperature":"22C"}',
+            },
+          ],
+        },
+      });
+      subscriber.onActivitySnapshotEvent?.({
+        event: {
+          type: "ACTIVITY_SNAPSHOT",
+          activityType: "mcp-apps",
+          content: {
+            toolCallId: "call-1",
+            result: callToolResult,
+            resourceUri: "ui://srv/mcp-app.html",
+            serverId: "srv",
+          },
+        },
+      });
+      subscriber.onRunFinalized?.();
+    });
+    const agent = { runAgent } as unknown as HttpAgent;
+
+    const core = createCore(agent);
+    await core.append(createAppendMessage());
+
+    const assistant = core
+      .getMessages()
+      .find((m) => m.role === "assistant") as ThreadAssistantMessage;
+    const toolPart = assistant.content.find(
+      (p) => p.type === "tool-call",
+    ) as any;
+    expect(toolPart.mcp.app).toEqual({
+      resourceUri: "ui://srv/mcp-app.html",
+      serverId: "srv",
+    });
+    expect(toolPart.result).toEqual(callToolResult);
+    expect(toolPart.isError).toBe(false);
+    expect(toolPart.modelContent).toEqual([
+      { type: "text", text: '{"temperature":"22C"}' },
+    ]);
+  });
+
+  it("applies a later cross-run result when the snapshot only attached the app", async () => {
+    const runAgent = vi.fn(async (_input: any, subscriber: any) => {
+      subscriber.onMessagesSnapshotEvent?.({
+        event: {
+          type: "MESSAGES_SNAPSHOT",
+          messages: [
+            { id: "msg-1", role: "user", content: "What's the weather?" },
+            {
+              id: "msg-2",
+              role: "assistant",
+              content: "",
+              toolCalls: [
+                {
+                  id: "call-1",
+                  type: "function",
+                  function: {
+                    name: "get_weather",
+                    arguments: '{"city":"Paris"}',
+                  },
+                },
+              ],
+            },
+          ],
+        },
+      });
+      subscriber.onActivitySnapshotEvent?.({
+        event: {
+          type: "ACTIVITY_SNAPSHOT",
+          activityType: "mcp-apps",
+          content: {
+            toolCallId: "call-1",
+            resourceUri: "ui://srv/mcp-app.html",
+            serverId: "srv",
+          },
+        },
+      });
+      subscriber.onToolCallResultEvent?.({
+        event: {
+          type: "TOOL_CALL_RESULT",
+          toolCallId: "call-1",
+          messageId: "tool-msg-1",
+          role: "tool",
+          content: '{"temperature":"22C"}',
+        },
+      });
+      subscriber.onRunFinalized?.();
+    });
+    const agent = { runAgent } as unknown as HttpAgent;
+
+    const core = createCore(agent);
+    await core.append(createAppendMessage());
+
+    const assistant = core
+      .getMessages()
+      .find((m) => m.role === "assistant") as ThreadAssistantMessage;
+    const toolPart = assistant.content.find(
+      (p) => p.type === "tool-call",
+    ) as any;
+    expect(toolPart.mcp.app).toEqual({
+      resourceUri: "ui://srv/mcp-app.html",
+      serverId: "srv",
+    });
+    expect(toolPart.result).toEqual({ temperature: "22C" });
+  });
+
+  it("attaches mcp app metadata from a cross-run TOOL_CALL_RESULT's _meta ui/resourceUri carrier", async () => {
+    const runAgent = vi.fn(async (_input: any, subscriber: any) => {
+      subscriber.onMessagesSnapshotEvent?.({
+        event: {
+          type: "MESSAGES_SNAPSHOT",
+          messages: [
+            { id: "msg-1", role: "user", content: "What's the weather?" },
+            {
+              id: "msg-2",
+              role: "assistant",
+              content: "",
+              toolCalls: [
+                {
+                  id: "call-1",
+                  type: "function",
+                  function: {
+                    name: "get_weather",
+                    arguments: '{"city":"Paris"}',
+                  },
+                },
+              ],
+            },
+          ],
+        },
+      });
+      subscriber.onToolCallResultEvent?.({
+        event: {
+          type: "TOOL_CALL_RESULT",
+          toolCallId: "call-1",
+          messageId: "tool-msg-1",
+          role: "tool",
+          content: '{"temperature":"22C"}',
+          _meta: { "ui/resourceUri": "ui://example/widget" },
+        },
+      });
+      subscriber.onRunFinalized?.();
+    });
+    const agent = { runAgent } as unknown as HttpAgent;
+
+    const core = createCore(agent);
+    await core.append(createAppendMessage());
+
+    const assistant = core
+      .getMessages()
+      .find((m) => m.role === "assistant") as ThreadAssistantMessage;
+    const toolPart = assistant.content.find(
+      (p) => p.type === "tool-call",
+    ) as any;
+    expect(toolPart.mcp).toEqual({
+      app: { resourceUri: "ui://example/widget" },
+    });
+  });
+
+  it("preserves the snapshot result when a later cross-run TOOL_CALL_RESULT arrives", async () => {
+    const callToolResult = {
+      content: [{ type: "text", text: "22C" }],
+      structuredContent: { temperature: "22C" },
+      isError: false,
+    };
+    const runAgent = vi.fn(async (_input: any, subscriber: any) => {
+      subscriber.onMessagesSnapshotEvent?.({
+        event: {
+          type: "MESSAGES_SNAPSHOT",
+          messages: [
+            { id: "msg-1", role: "user", content: "What's the weather?" },
+            {
+              id: "msg-2",
+              role: "assistant",
+              content: "",
+              toolCalls: [
+                {
+                  id: "call-1",
+                  type: "function",
+                  function: {
+                    name: "get_weather",
+                    arguments: '{"city":"Paris"}',
+                  },
+                },
+              ],
+            },
+          ],
+        },
+      });
+      subscriber.onActivitySnapshotEvent?.({
+        event: {
+          type: "ACTIVITY_SNAPSHOT",
+          activityType: "mcp-apps",
+          content: {
+            toolCallId: "call-1",
+            result: callToolResult,
+            resourceUri: "ui://srv/mcp-app.html",
+            serverId: "srv",
+          },
+        },
+      });
+      subscriber.onToolCallResultEvent?.({
+        event: {
+          type: "TOOL_CALL_RESULT",
+          toolCallId: "call-1",
+          messageId: "tool-msg-1",
+          role: "tool",
+          content: '{"temperature":"22C"}',
+        },
+      });
+      subscriber.onRunFinalized?.();
+    });
+    const agent = { runAgent } as unknown as HttpAgent;
+
+    const core = createCore(agent);
+    await core.append(createAppendMessage());
+
+    const assistant = core
+      .getMessages()
+      .find((m) => m.role === "assistant") as ThreadAssistantMessage;
+    const toolPart = assistant.content.find(
+      (p) => p.type === "tool-call",
+    ) as any;
+    expect(toolPart.result).toEqual(callToolResult);
+    expect(toolPart.modelContent).toEqual([
+      { type: "text", text: '{"temperature":"22C"}' },
+    ]);
+  });
+
+  it("clears a stale cross-run error when the snapshot result succeeds", async () => {
+    const runAgent = vi.fn(async (_input: any, subscriber: any) => {
+      subscriber.onMessagesSnapshotEvent?.({
+        event: {
+          type: "MESSAGES_SNAPSHOT",
+          messages: [
+            { id: "msg-1", role: "user", content: "What's the weather?" },
+            {
+              id: "msg-2",
+              role: "assistant",
+              content: "",
+              toolCalls: [
+                {
+                  id: "call-1",
+                  type: "function",
+                  function: {
+                    name: "get_weather",
+                    arguments: '{"city":"Paris"}',
+                  },
+                },
+              ],
+            },
+          ],
+        },
+      });
+      subscriber.onToolCallResultEvent?.({
+        event: {
+          type: "TOOL_CALL_RESULT",
+          toolCallId: "call-1",
+          messageId: "tool-msg-1",
+          role: "tool",
+          content: "boom",
+          mcpResult: {
+            content: [{ type: "text", text: "boom" }],
+            isError: true,
+          },
+        },
+      });
+      subscriber.onActivitySnapshotEvent?.({
+        event: {
+          type: "ACTIVITY_SNAPSHOT",
+          activityType: "mcp-apps",
+          content: {
+            toolCallId: "call-1",
+            result: { content: [{ type: "text", text: "22C" }] },
+            resourceUri: "ui://srv/mcp-app.html",
+            serverId: "srv",
+          },
+        },
+      });
+      subscriber.onRunFinalized?.();
+    });
+    const agent = { runAgent } as unknown as HttpAgent;
+
+    const core = createCore(agent);
+    await core.append(createAppendMessage());
+
+    const assistant = core
+      .getMessages()
+      .find((m) => m.role === "assistant") as ThreadAssistantMessage;
+    const toolPart = assistant.content.find(
+      (p) => p.type === "tool-call",
+    ) as any;
+    expect(toolPart.isError).toBe(false);
+    expect(toolPart.result).toEqual({
+      content: [{ type: "text", text: "22C" }],
+    });
+  });
+
+  it("falls back to the aggregator when an mcp-apps ACTIVITY_SNAPSHOT has no owning message", async () => {
+    const runAgent = vi.fn(async (_input: any, subscriber: any) => {
+      subscriber.onActivitySnapshotEvent?.({
+        event: {
+          type: "ACTIVITY_SNAPSHOT",
+          activityType: "mcp-apps",
+          content: {
+            toolCallId: "orphan-1",
+            result: { content: [], isError: false },
+            resourceUri: "ui://srv/mcp-app.html",
+          },
+        },
+      });
+      subscriber.onTextMessageContentEvent?.({
+        event: { type: "TEXT_MESSAGE_CONTENT", delta: "Hello" },
+      });
+      subscriber.onRunFinalized?.();
+    });
+    const agent = { runAgent } as unknown as HttpAgent;
+
+    const core = createCore(agent);
+    await core.append(createAppendMessage());
+
+    const assistant = core
+      .getMessages()
+      .find((m) => m.role === "assistant") as ThreadAssistantMessage;
+    expect(
+      assistant.content.filter((p) => p.type === "tool-call"),
+    ).toHaveLength(0);
+    expect(assistant.content).toContainEqual(
+      expect.objectContaining({ type: "text", text: "Hello" }),
+    );
+  });
+
   it("rejects interrupt resume that does not cover every open interrupt", async () => {
     const runAgent = vi.fn(async (input: any, subscriber: any) => {
       subscriber.onRunFinishedEvent?.({
@@ -3001,7 +3537,62 @@ describe("AGUIThreadRuntimeCore", () => {
         { interruptId: "int-1", status: "resolved" },
         { interruptId: "int-unknown", status: "resolved" },
       ]),
-    ).rejects.toThrow(/unknown interrupt ids: int-unknown/);
+    ).rejects.toThrow(/unknown interrupt id int-unknown/);
+    expect(runAgent).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports an unknown interrupt id even when open interrupts are unanswered", async () => {
+    const runAgent = vi.fn(async (input: any, subscriber: any) => {
+      subscriber.onRunFinishedEvent?.({
+        event: {
+          type: "RUN_FINISHED",
+          runId: input.runId,
+          outcome: {
+            type: "interrupt",
+            interrupts: [{ id: "int-1", reason: "tool_call" }],
+          },
+        },
+      });
+      subscriber.onRunFinalized?.();
+    });
+    const agent = { runAgent } as unknown as HttpAgent;
+
+    const core = createCore(agent);
+    await core.append(createAppendMessage());
+
+    await expect(
+      core.submitInterruptResponses([
+        { interruptId: "int-unknown", status: "resolved" },
+      ]),
+    ).rejects.toThrow(/unknown interrupt id int-unknown/);
+    expect(runAgent).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports an unknown interrupt id when the same unknown id is submitted twice", async () => {
+    const runAgent = vi.fn(async (input: any, subscriber: any) => {
+      subscriber.onRunFinishedEvent?.({
+        event: {
+          type: "RUN_FINISHED",
+          runId: input.runId,
+          outcome: {
+            type: "interrupt",
+            interrupts: [{ id: "int-1", reason: "tool_call" }],
+          },
+        },
+      });
+      subscriber.onRunFinalized?.();
+    });
+    const agent = { runAgent } as unknown as HttpAgent;
+
+    const core = createCore(agent);
+    await core.append(createAppendMessage());
+
+    await expect(
+      core.submitInterruptResponses([
+        { interruptId: "int-unknown", status: "resolved" },
+        { interruptId: "int-unknown", status: "cancelled" },
+      ]),
+    ).rejects.toThrow(/unknown interrupt id int-unknown/);
     expect(runAgent).toHaveBeenCalledTimes(1);
   });
 
@@ -3058,6 +3649,36 @@ describe("AGUIThreadRuntimeCore", () => {
         { interruptId: "int-1", status: "cancelled" },
       ]),
     ).rejects.toThrow(/duplicate response/);
+    expect(runAgent).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects resume entries without an interruptId or with an invalid status", async () => {
+    const runAgent = vi.fn(async (input: any, subscriber: any) => {
+      subscriber.onRunFinishedEvent?.({
+        event: {
+          type: "RUN_FINISHED",
+          runId: input.runId,
+          outcome: {
+            type: "interrupt",
+            interrupts: [{ id: "int-1", reason: "tool_call" }],
+          },
+        },
+      });
+      subscriber.onRunFinalized?.();
+    });
+    const agent = { runAgent } as unknown as HttpAgent;
+
+    const core = createCore(agent);
+    await core.append(createAppendMessage());
+
+    await expect(
+      core.submitInterruptResponses([{ status: "resolved" } as any]),
+    ).rejects.toThrow("every entry must have an interruptId");
+    await expect(
+      core.submitInterruptResponses([
+        { interruptId: "int-1", status: "nope" } as any,
+      ]),
+    ).rejects.toThrow(/invalid status "nope" for interrupt int-1/);
     expect(runAgent).toHaveBeenCalledTimes(1);
   });
 
@@ -3695,5 +4316,174 @@ describe("AGUIThreadRuntimeCore", () => {
       "msg-2",
     ]);
     expect(core.getMessageRepository().headId).toBe("msg-2");
+  });
+
+  it("streams text incrementally when a MESSAGES_SNAPSHOT is emitted during a run (#5307)", async () => {
+    const mid = "11111111-2222-3333-4444-555555555555";
+    const words =
+      "This is just a test to reproduce the streaming bug that has been identified in ag-ui runtime.".split(
+        " ",
+      );
+    const observed: { full: string; text: string }[] = [];
+    const agent = {
+      runAgent: vi.fn(async (_input, subscriber) => {
+        subscriber.onMessagesSnapshotEvent?.({
+          event: {
+            type: "MESSAGES_SNAPSHOT",
+            messages: [{ id: "u-snap", role: "user", content: "hi" }],
+          },
+        });
+        subscriber.onTextMessageStartEvent?.({
+          event: { type: "TEXT_MESSAGE_START", messageId: mid },
+        });
+        let full = "";
+        for (let i = 0; i < words.length; i++) {
+          const delta = (i ? " " : "") + words[i];
+          full += delta;
+          subscriber.onTextMessageContentEvent?.({
+            event: { type: "TEXT_MESSAGE_CONTENT", messageId: mid, delta },
+          });
+          observed.push({
+            full,
+            text: assistantText(
+              core.getMessages().find((m) => m.role === "assistant"),
+            ),
+          });
+        }
+        subscriber.onTextMessageEndEvent?.({
+          event: { type: "TEXT_MESSAGE_END", messageId: mid },
+        });
+        subscriber.onMessagesSnapshotEvent?.({
+          event: {
+            type: "MESSAGES_SNAPSHOT",
+            messages: [
+              { id: "u-snap", role: "user", content: "hi" },
+              { id: mid, role: "assistant", content: full },
+            ],
+          },
+        });
+        subscriber.onStateSnapshotEvent?.({
+          event: { type: "STATE_SNAPSHOT", snapshot: {} },
+        });
+        subscriber.onRunFinalized?.();
+      }),
+    } as unknown as HttpAgent;
+
+    const core = createCore(agent);
+    await core.append(createAppendMessage());
+
+    expect(observed).toHaveLength(words.length);
+    for (const { full, text } of observed) expect(text).toBe(full);
+    expect(
+      assistantText(core.getMessages().find((m) => m.role === "assistant")),
+    ).toBe(words.join(" "));
+  });
+
+  it("streams text incrementally when no snapshot is emitted during a run", async () => {
+    const mid = "22222222-3333-4444-5555-666666666666";
+    const words = "A simple incremental streaming baseline.".split(" ");
+    const observed: { full: string; text: string }[] = [];
+    const agent = {
+      runAgent: vi.fn(async (_input, subscriber) => {
+        subscriber.onTextMessageStartEvent?.({
+          event: { type: "TEXT_MESSAGE_START", messageId: mid },
+        });
+        let full = "";
+        for (let i = 0; i < words.length; i++) {
+          const delta = (i ? " " : "") + words[i];
+          full += delta;
+          subscriber.onTextMessageContentEvent?.({
+            event: { type: "TEXT_MESSAGE_CONTENT", messageId: mid, delta },
+          });
+          observed.push({
+            full,
+            text: assistantText(
+              core.getMessages().find((m) => m.role === "assistant"),
+            ),
+          });
+        }
+        subscriber.onRunFinalized?.();
+      }),
+    } as unknown as HttpAgent;
+
+    const core = createCore(agent);
+    await core.append(createAppendMessage());
+
+    expect(observed).toHaveLength(words.length);
+    for (const { full, text } of observed) expect(text).toBe(full);
+  });
+
+  it("renders an assistant delivered via MESSAGES_SNAPSHOT without text deltas", async () => {
+    const mid = "33333333-4444-5555-6666-777777777777";
+    const agent = {
+      runAgent: vi.fn(async (_input, subscriber) => {
+        subscriber.onMessagesSnapshotEvent?.({
+          event: {
+            type: "MESSAGES_SNAPSHOT",
+            messages: [
+              { id: "u-snap", role: "user", content: "hi" },
+              { id: mid, role: "assistant", content: "Hello from snapshot" },
+            ],
+          },
+        });
+        subscriber.onStateSnapshotEvent?.({
+          event: { type: "STATE_SNAPSHOT", snapshot: {} },
+        });
+        subscriber.onRunFinalized?.();
+      }),
+    } as unknown as HttpAgent;
+
+    const core = createCore(agent);
+    await core.append(createAppendMessage());
+
+    expect(
+      assistantText(core.getMessages().find((m) => m.role === "assistant")),
+    ).toBe("Hello from snapshot");
+  });
+
+  it("keeps streaming when a pre-start snapshot ends with a prior-turn assistant", async () => {
+    const mid = "99999999-8888-7777-6666-555555555555";
+    const observed: string[] = [];
+    let core: AgUiThreadRuntimeCore;
+    const readText = () => {
+      const byId = core.getMessages().find((x) => x.id === mid);
+      const m =
+        byId ??
+        core
+          .getMessages()
+          .filter((x) => x.role === "assistant")
+          .at(-1);
+      const t = m?.content.find((p) => p.type === "text");
+      return t && t.type === "text" && t.text.length > 0 ? t.text : "<none>";
+    };
+    const agent = {
+      runAgent: vi.fn(async (_input, subscriber) => {
+        subscriber.onMessagesSnapshotEvent?.({
+          event: {
+            type: "MESSAGES_SNAPSHOT",
+            messages: [
+              { id: "u1", role: "user", content: "earlier question" },
+              { id: "a1", role: "assistant", content: "earlier answer" },
+            ],
+          },
+        });
+        subscriber.onTextMessageStartEvent?.({
+          event: { type: "TEXT_MESSAGE_START", messageId: mid },
+        });
+        for (const delta of ["Hel", "lo"]) {
+          subscriber.onTextMessageContentEvent?.({
+            event: { type: "TEXT_MESSAGE_CONTENT", messageId: mid, delta },
+          });
+          observed.push(readText());
+        }
+        subscriber.onTextMessageEndEvent?.({
+          event: { type: "TEXT_MESSAGE_END", messageId: mid },
+        });
+        subscriber.onRunFinalized?.();
+      }),
+    } as unknown as HttpAgent;
+    core = createCore(agent);
+    await core.append(createAppendMessage());
+    expect(observed).toEqual(["Hel", "Hello"]);
   });
 });

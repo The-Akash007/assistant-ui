@@ -1352,6 +1352,7 @@ type ThreadHistoryAdapter = {
   }>;
   resume?(options: ChatModelRunOptions): AsyncGenerator<ChatModelRunResult, void, unknown>;
   append(item: ExportedMessageRepositoryItem): Promise<void>;
+  update?(item: ExportedMessageRepositoryItem): Promise<void>;
   delete?(items: ExportedMessageRepositoryItem[]): Promise<void>;
   withFormat?<TMessage, TStorageFormat extends Record<string, unknown>>(formatAdapter: MessageFormatAdapter<TMessage, TStorageFormat>): GenericThreadHistoryAdapter<TMessage>;
 };
@@ -1599,6 +1600,7 @@ type ThreadUserMessage = MessageCommonProps & {
     readonly steps?: undefined;
     readonly submittedFeedback?: undefined;
     readonly timing?: undefined;
+    readonly isOptimistic?: boolean;
     readonly custom: Record<string, unknown>;
   };
 };
@@ -1636,6 +1638,7 @@ type ToolApprovalResponse = {
 type ToolBase<TArgs extends Record<string, unknown> = Record<string, unknown>, TResult = unknown> = {
   streamCall?: ToolStreamCallFunction<TArgs, TResult>;
   display?: ToolDisplay;
+  overwrite?: boolean;
 };
 
 interface ToolCallArgsReader<TArgs extends Record<string, unknown>> {
@@ -1843,9 +1846,16 @@ declare function a2aPartsToContent(parts: A2APart[]): ThreadAssistantMessage["co
 
 declare function contentPartsToA2AParts(content: ReadonlyArray<{
   type: string;
-  text?: string;
-  image?: string;
-}>): A2APart[];
+  text?: string | undefined;
+  image?: string | undefined;
+  data?: unknown;
+  mimeType?: string | undefined;
+  filename?: string | undefined;
+  audio?: {
+    data: string;
+    format: string;
+  } | undefined;
+}>, fallbackMimeType?: string): A2APart[];
 
 declare global {
   interface Window {
