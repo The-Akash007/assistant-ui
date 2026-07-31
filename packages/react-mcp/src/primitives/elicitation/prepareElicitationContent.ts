@@ -1,39 +1,46 @@
+import { validateElicitationContent } from "../../resources/validateElicitationContent";
+
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
-const coerceValue = (
-  schema: unknown,
-  value: unknown,
-): { value: unknown; invalid: boolean } => {
+const coerceValue = (schema: unknown, value: unknown): unknown => {
   if (!isRecord(schema) || typeof value !== "string") {
-    return { value, invalid: false };
+    return value;
   }
   if (schema.type !== "number" && schema.type !== "integer") {
-    return { value, invalid: false };
+    return value;
   }
 
   const number = Number(value);
-  if (value.trim() === "") return { value, invalid: false };
-  if (!Number.isFinite(number)) return { value, invalid: true };
+  if (value.trim() === "") return value;
+  if (!Number.isFinite(number)) return value;
   if (schema.type === "integer" && !Number.isInteger(number)) {
-    return { value, invalid: true };
+    return value;
   }
-  return { value: number, invalid: false };
+  return number;
 };
 
 const isBooleanSchema = (schema: unknown): schema is Record<string, unknown> =>
   isRecord(schema) && schema.type === "boolean";
 
-const getDraftValue = (draft: Record<string, unknown>, name: string) =>
-  Object.hasOwn(draft, name) ? draft[name] : undefined;
+const isNonStringTypedSchema = (schema: Record<string, unknown>): boolean =>
+  schema.type === "boolean" ||
+  schema.type === "number" ||
+  schema.type === "integer";
 
-const isAbsentDraftValue = (value: unknown) =>
-  value === undefined || value === null || value === "";
+const schemaAdmitsEmptyString = (schema: unknown): boolean => {
+  if (!isRecord(schema) || isNonStringTypedSchema(schema)) return false;
 
-const isInvalidBooleanDraftValue = (schema: unknown, value: unknown) =>
-  isBooleanSchema(schema) &&
-  !isAbsentDraftValue(value) &&
-  typeof value !== "boolean";
+  const values = Object.hasOwn(schema, "enum") ? schema.enum : undefined;
+  if (Array.isArray(values)) return values.includes("");
+
+  return Object.hasOwn(schema, "default") && schema.default === "";
+};
+
+const isAbsentDraftValue = (schema: unknown, value: unknown) =>
+  value === undefined ||
+  value === null ||
+  (value === "" && !schemaAdmitsEmptyString(schema));
 
 export const prepareElicitationContent = (
   requestedSchema: unknown,
@@ -47,54 +54,63 @@ export const prepareElicitationContent = (
     isRecord(requestedSchema) && isRecord(requestedSchema.properties)
       ? requestedSchema.properties
       : {};
-  const required =
-    isRecord(requestedSchema) && Array.isArray(requestedSchema.required)
-      ? requestedSchema.required.filter(
-          (property): property is string => typeof property === "string",
-        )
-      : [];
-
-  const preparedDraft = Object.entries(draft).flatMap(([name, value]) => {
-    const schema = properties[name];
-    if (value === undefined || value === null) return [];
-    if (
-      isBooleanSchema(schema) &&
-      (isAbsentDraftValue(value) || isInvalidBooleanDraftValue(schema, value))
-    ) {
-      return [];
-    }
-
-    const coerced = coerceValue(schema, value);
-    return coerced.invalid ? [] : [[name, coerced.value]];
-  });
-  const invalid = Object.entries(draft).flatMap(([name, value]) => {
-    const schema = properties[name];
-    return isInvalidBooleanDraftValue(schema, value) ||
-      coerceValue(schema, value).invalid
-      ? [name]
-      : [];
-  });
-  const requiredBooleans = required.flatMap((name) =>
-    isBooleanSchema(properties[name]) &&
-    isAbsentDraftValue(getDraftValue(draft, name))
-      ? [
-          [
-            name,
-            typeof properties[name].default === "boolean"
-              ? properties[name].default
-              : false,
-          ],
-        ]
-      : [],
+  const candidateContent = Object.fromEntries(
+    Object.entries(draft).flatMap(([name, value]) => {
+      const schema = properties[name];
+      if (isAbsentDraftValue(schema, value)) return [];
+      return [[name, coerceValue(schema, value)]];
+    }),
   );
+  const missingRequiredBooleans = validateElicitationContent(
+    requestedSchema,
+    candidateContent,
+  ).filter(
+    ({ property }) =>
+      isBooleanSchema(properties[property]) &&
+      !Object.hasOwn(candidateContent, property),
+  );
+  const contentWithBooleanDefaults = {
+    ...candidateContent,
+    ...Object.fromEntries(
+      missingRequiredBooleans.map(({ property }) => [
+        property,
+        typeof properties[property].default === "boolean"
+          ? properties[property].default
+          : false,
+      ]),
+    ),
+  };
+  const validationErrors = validateElicitationContent(
+    requestedSchema,
+    contentWithBooleanDefaults,
+  );
+  const missingRequired = [
+    ...new Set(
+      validationErrors
+        .filter(
+          ({ property }) =>
+            !Object.hasOwn(contentWithBooleanDefaults, property),
+        )
+        .map(({ property }) => property),
+    ),
+  ];
+  const invalid = [
+    ...new Set(
+      validationErrors
+        .filter(({ property }) =>
+          Object.hasOwn(contentWithBooleanDefaults, property),
+        )
+        .map(({ property }) => property),
+    ),
+  ];
 
   return {
-    content: Object.fromEntries([...preparedDraft, ...requiredBooleans]),
-    missingRequired: required.filter(
-      (name) =>
-        !isBooleanSchema(properties[name]) &&
-        isAbsentDraftValue(getDraftValue(draft, name)),
+    content: Object.fromEntries(
+      Object.entries(contentWithBooleanDefaults).filter(
+        ([property]) => !invalid.includes(property),
+      ),
     ),
+    missingRequired,
     invalid,
   };
 };

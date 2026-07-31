@@ -246,4 +246,207 @@ describe("toCreateMessage", () => {
       },
     ]);
   });
+
+  it("wraps bare base64 file data so the url survives convertToModelMessages", async () => {
+    const message = {
+      ...baseMessage,
+      content: [
+        { type: "file", data: "JVBERi0xLjQ=", mimeType: "application/pdf" },
+      ],
+    } as unknown as AppendMessage;
+
+    const result = toCreateMessage(message);
+
+    expect(result.parts).toEqual([
+      {
+        type: "file",
+        url: "data:application/pdf;base64,JVBERi0xLjQ=",
+        mediaType: "application/pdf",
+      },
+    ]);
+
+    // convertToModelMessages is async and passes `url` to an unguarded
+    // `new URL()`, so the bare payload rejects while the wrapped one resolves.
+    const { convertToModelMessages } = await import("ai");
+    await expect(
+      convertToModelMessages([{ ...result, id: "m1" } as never]),
+    ).resolves.toBeDefined();
+    await expect(
+      convertToModelMessages([
+        {
+          id: "m1",
+          role: "user",
+          parts: [
+            {
+              type: "file",
+              url: "JVBERi0xLjQ=",
+              mediaType: "application/pdf",
+            },
+          ],
+        } as never,
+      ]),
+    ).rejects.toThrow(/Invalid URL/);
+  });
+
+  it("wraps bare base64 image data using the resolved media type", () => {
+    const message = {
+      ...baseMessage,
+      content: [{ type: "image", image: "QUJD", contentType: "image/webp" }],
+    } as unknown as AppendMessage;
+
+    expect(toCreateMessage(message).parts).toEqual([
+      {
+        type: "file",
+        url: "data:image/webp;base64,QUJD",
+        mediaType: "image/webp",
+      },
+    ]);
+  });
+
+  it("leaves an id reference unwrapped rather than shipping it as base64", () => {
+    const message = {
+      ...baseMessage,
+      content: [
+        {
+          type: "file",
+          data: "file-abc123",
+          mimeType: "application/pdf",
+          sourceType: "id",
+        },
+      ],
+    } as unknown as AppendMessage;
+
+    expect(toCreateMessage(message).parts).toEqual([
+      { type: "file", url: "file-abc123", mediaType: "application/pdf" },
+    ]);
+  });
+
+  it("forwards blob and other parsable url schemes untouched", () => {
+    const message = {
+      ...baseMessage,
+      content: [
+        { type: "image", image: "blob:https://app.example/1-2-3" },
+        {
+          type: "file",
+          data: "blob:https://app.example/4-5-6",
+          mimeType: "application/pdf",
+        },
+      ],
+    } as unknown as AppendMessage;
+
+    const urls = toCreateMessage(message).parts.map((p) =>
+      "url" in p ? p.url : undefined,
+    );
+
+    expect(urls).toEqual([
+      "blob:https://app.example/1-2-3",
+      "blob:https://app.example/4-5-6",
+    ]);
+  });
+
+  it("converts an audio part into a file part with the format-derived media type", () => {
+    const message = {
+      ...baseMessage,
+      content: [{ type: "audio", audio: { data: "QUJD", format: "mp3" } }],
+    } as unknown as AppendMessage;
+
+    const result = toCreateMessage(message);
+
+    expect(result.parts).toEqual([
+      {
+        type: "file",
+        url: "data:audio/mp3;base64,QUJD",
+        mediaType: "audio/mp3",
+      },
+    ]);
+  });
+
+  it("converts a wav audio part", () => {
+    const message = {
+      ...baseMessage,
+      content: [{ type: "audio", audio: { data: "QUJD", format: "wav" } }],
+    } as unknown as AppendMessage;
+
+    const result = toCreateMessage(message);
+
+    expect(result.parts).toEqual([
+      {
+        type: "file",
+        url: "data:audio/wav;base64,QUJD",
+        mediaType: "audio/wav",
+      },
+    ]);
+  });
+
+  it("rebuilds the audio data URL envelope from the typed format", () => {
+    const message = {
+      ...baseMessage,
+      content: [
+        {
+          type: "audio",
+          audio: { data: "data:audio/mpeg;base64,QUJD", format: "mp3" },
+        },
+      ],
+    } as unknown as AppendMessage;
+
+    const result = toCreateMessage(message);
+
+    expect(result.parts).toEqual([
+      {
+        type: "file",
+        url: "data:audio/mp3;base64,QUJD",
+        mediaType: "audio/mp3",
+      },
+    ]);
+  });
+
+  it("forwards an http audio source instead of wrapping it in a data URL", () => {
+    const message = {
+      ...baseMessage,
+      content: [
+        {
+          type: "audio",
+          audio: { data: "https://cdn.example.com/memo.mp3", format: "mp3" },
+        },
+      ],
+    } as unknown as AppendMessage;
+
+    const result = toCreateMessage(message);
+
+    expect(result.parts).toEqual([
+      {
+        type: "file",
+        url: "https://cdn.example.com/memo.mp3",
+        mediaType: "audio/mp3",
+      },
+    ]);
+  });
+
+  it("keeps the attachment name on audio attachment content", () => {
+    const message = {
+      ...baseMessage,
+      content: [],
+      attachments: [
+        {
+          id: "some-id",
+          type: "audio",
+          name: "audio.mp3",
+          contentType: "audio/mp3",
+          status: { type: "complete" },
+          content: [{ type: "audio", audio: { data: "QUJD", format: "mp3" } }],
+        },
+      ],
+    } as unknown as AppendMessage;
+
+    const result = toCreateMessage(message);
+
+    expect(result.parts).toEqual([
+      {
+        type: "file",
+        url: "data:audio/mp3;base64,QUJD",
+        mediaType: "audio/mp3",
+        filename: "audio.mp3",
+      },
+    ]);
+  });
 });
