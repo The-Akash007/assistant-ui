@@ -1,0 +1,47 @@
+name: Semgrep Fast SAST
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch: {}
+
+jobs:
+  semgrep:
+    name: Semgrep Fast SAST
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run Semgrep (official action)
+        uses: returntocorp/semgrep-action@v2
+        with:
+          # Point this to your custom rules directory or a Semgrep registry config
+          # Examples:
+          #  - Use rules included in the repo: .semgrep-rules/
+          #  - Use a single config file in the repo: .semgrep.yml
+          #  - Use Semgrep registry rules: p/ci or security-audit
+          config: .semgrep-rules/
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          format: sarif
+          output-file: semgrep-results.sarif
+
+      - name: Upload SARIF to GitHub code scanning (if present)
+        if: always()
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: semgrep-results.sarif
+
+      - name: Upload Semgrep JSON results as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: semgrep-results-json
+          path: semgrep-results.json
+
+# Notes:
+# - Create a .semgrep-rules/ directory in the repo with your custom rules (YAML files).
+# - Alternatively, replace `config: .semgrep-rules/` with `config: .semgrep.yml` or a registry config like `p/ci`.
+# - The semgrep-action will annotate PRs and can generate SARIF for GitHub Code Scanning.
